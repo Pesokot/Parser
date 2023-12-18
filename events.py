@@ -1,133 +1,90 @@
-import aioredis
 import asyncio
-
 import time
-import ujson
-
-import logging
-logger = logging.getLogger('events')
-
+import orjson
 from contextlib import asynccontextmanager
 
-# is_live никак не используется
+import logging
+logger = logging.getLogger('event_publisher')
+
+# timeout=5
+# можно в транзакциб положить expire если надо.
+
+try:
+    import aioredis
+    logger.warning(f"using {aioredis.VERSION=}")
+except:
+    from redis import asyncio as aioredis
+    logger.warning(f"using redis.asyncio!")
+
+
 class EventPublisherPool():
     @classmethod
     @asynccontextmanager
-    async def create(cls, redis_list, bookmaker_id=None, *, is_live=True, timeout=5, publisher=None):
+    async def create(cls, redis_list, bookmaker_id, publisher='', *, use_transactions=True):
         self = EventPublisherPool()
-        self.eps = [ await EventPublisher.create(redis, bookmaker_id, is_live=is_live, timeout=timeout, publisher=publisher) for redis in redis_list ]
+
+        self.channel = f"events:{bookmaker_id}"
+        self.hash_path = f"match:{bookmaker_id}"
+        self.use_transactions = use_transactions
+
+        self.redises = [ aioredis.from_url( f"redis://{host}:{port}", password=password) for host, port, password in redis_list ]
+
         try:
+            await self.send("parser_started")
             yield self
         finally:
-            for ep in self.eps:
-                await ep.send("parser_finished")
+            await self.send("parser_finished")
+            for redis in self.redises:
+                await redis.close()
 
+    async def send(self, code, data=None, *, msg_ts=None):
+        jmsg, jdata = build_message(code, data, msg_ts)
 
-    async def send(self, message, data=None):
-        coroutines = [ ep.send(message, data) for ep in self.eps ]
-        await asyncio.gather(*coroutines)
+        tasks = [ self._transact(redis, code, jmsg, jdata, data) for redis in self.redises ]
+        await asyncio.gather(*tasks)
+        logger.debug(f"event sent: {jmsg}")
 
-class EventPublisher():
-    # асинхронный конструктор
-    @classmethod
-    async def create(cls, redis, bookmaker_id=None, *, is_live=True, timeout=5, publisher=None):
-        self = EventPublisher()
+    async def set(self, key, value):
+        tasks = [ redis.set(key, value) for redis in self.redises ]
+        await asyncio.gather(*tasks)
 
-        self.host, self.port, self.password = redis
-        self.loop = asyncio.get_event_loop()
+    async def _transact(self, redis, code, jmsg, jdata, data):
+        async with redis.pipeline(transaction=self.use_transactions) as pipe:
+            if code == "match_changed":
+                return await (pipe.publish(self.channel, jmsg).hset(self.hash_path, data["id"], jdata).execute())
+            elif code == "match_removed":
+                return await (pipe.publish(self.channel, jmsg).hdel(self.hash_path, data).execute())
+            elif code in ("parser_started", "parser_finished"):
+                return await (pipe.publish(self.channel, jmsg).delete(self.hash_path).execute())
 
-        self.timeout = timeout
-        self.bookmaker_id = bookmaker_id
+# важно чтобы data был последним в объекте. тогда его можно легко резать на приемке!
+# поменяли - match_removed->data:str ->  match_removed->mid:int, data теперь бывает только в match_changed, links_changed
+#  jmsg, jdata |  bytes, bytes |  json кодированный ивент и json кодированное тело матча.
+# msg_ts - это время создания этого сообщения в источнике. чтобы не тратить много места,
+# мы прилагаем инфу как количество миллисекунд задержки от создания в источнике до time.time()
+def build_message(code, data, msg_ts=None):
+    t = time.time()
+    msg = {"type": code, "ts": round(t, 3) }
+    if msg_ts is not None:
+        msg['d'] = int(1000*(t - msg_ts))
 
-        self.live = is_live
-        self.publisher = publisher or f"event_publisher for {self.bookmaker_id}"
+    if code in ("parser_started", "parser_finished"):
+        return orjson.dumps(msg), None
 
-        self.redis = None
-        if bookmaker_id:
-            self.event_channel = f"events:{self.bookmaker_id}"
-            self.hash_path = f"match:{self.bookmaker_id}"
-            await self.send("parser_started")
-        return self
+    # матч поменялся. норм. data - это Match объект. dict короче
+    elif code == "match_changed":
+        msg['mid'] = int(data['id'])
+        msg['data'] = None
+        jmsg = orjson.dumps(msg)
 
-    async def send(self, message, data=None):
-        if not self.redis or self.redis.closed:
-            logger.warning('redis dead, fuck!')
-            self.redis = await aioredis.create_redis_pool(f"redis://{self.host}:{self.port}/0?encoding=utf-8", password=self.password, timeout=self.timeout)
+        jdata = orjson.dumps(data, option=orjson.OPT_NON_STR_KEYS)            # это кодированный матч
+        jmsg = jmsg.replace(b"null", jdata)   # это сообщение с данными
 
-        msg = {"type": message, "publisher": self.publisher, "timestamp": time.time(), "bookmaker_id": self.bookmaker_id, "live": self.live, "data": None}
-        # это типа пустой тик такой, нужно слать сообщение о старте парсинга, чтобы все перепрочитали стейты
-        if message in ("parser_started", "parser_finished"):
-            jmsg = await self.loop.run_in_executor(None, ujson.dumps, msg)
+        return jmsg, jdata
 
-            tr = self.redis.multi_exec()
-            fut1 = tr.publish(self.event_channel, jmsg)
-            fut2 = tr.delete(self.hash_path)
-            res = await tr.execute()
+    # матч закончился. норм. data - это mid.
+    elif code == "match_removed":
+        msg['mid'] = int(data)             # почему str ?это же int. наверное для обратной совместимости ?
+        return orjson.dumps(msg), None
 
-        # матч поменялся. норм. data - это Match объект. dict короче
-        if message == "match_changed":
-            msg["data"] = data['id']
-            jmsg = await self.loop.run_in_executor(None, ujson.dumps, msg)
-            jdata = await self.loop.run_in_executor(None, ujson.dumps, data)
-
-            tr = self.redis.multi_exec()
-            fut1 = tr.publish(self.event_channel, jmsg)
-            fut2 = tr.hset(self.hash_path, data["id"], jdata)
-            res = await tr.execute()
-
-        # матч закончился. норм. data - это mid.
-        if message == "match_removed":
-            msg["data"] = data
-            jmsg = await self.loop.run_in_executor(None, ujson.dumps, msg)
-
-            tr = self.redis.multi_exec()
-            fut1 = tr.publish(self.event_channel, jmsg)
-            fut2 = tr.hdel(self.hash_path, data)
-            res = await tr.execute()
-
-        # новые данные линковки. data - это LINKS собственно
-        if message == "links_changed":
-            msg["data"] = data
-            jmsg = await self.loop.run_in_executor(None, ujson.dumps, msg)
-            jdata = await self.loop.run_in_executor(None, ujson.dumps, data)
-
-            tr = self.redis.multi_exec()
-            fut1 = tr.publish("events:links", jmsg)
-            fut2 = tr.set("links", jdata)
-            res = await tr.execute()
-
-        logger.debug(f"event sent: {msg}")
-
-
-async def main():
-    # сделай в терминале redis-cli psubscribe "events:*"
-    R1 = "127.1", 6379, None
-    R2 = "127.1", 56379, "password"
-
-    REDIS_LIST = [ R1, R2 ]
-    BOOKMAKER_ID = 42
-
-    # можно так, но зачем?
-    # ep = await EventPublisher.create(R1, BOOKMAKER_ID)
-
-    # лучше так.
-    # EventPublisherPool ведет себя как EventPublisher и скрывает сложность в себе. просто делайте сразу пул из списка реквизитов редисов и не парьтесь.
-    epp = await EventPublisherPool.create(REDIS_LIST, BOOKMAKER_ID)
-    # в момент создания мы уже пошлем правильную parser_started транзакцию
-
-    await asyncio.sleep(5)
-
-    # осталось только следить за мутациями и звать метод если что
-    # допустим получился матч m и он только что мутировал. давайте опубликуем его. не дожидаясь конца отправки.
-    m = {"id":4545, "bookmaker_id": BOOKMAKER_ID, "periods_v2": {}}
-    asyncio.create_task( epp.send("match_changed", m) )
-    await asyncio.sleep(5)
-
-    # ой. матч закончился.
-    asyncio.create_task( epp.send("match_removed", 4545) )
-
-    # вот и все. вы великолепны.
-    # если мы опять захотим поменять тз и механизм публикаций или придумаем новые события, то просто не парьтесь. пусть парятся эти два объекта.
-
-if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(main())
+    raise Exception(f"unsupported {code=}, {data=}")
